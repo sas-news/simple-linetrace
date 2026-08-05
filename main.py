@@ -1,5 +1,5 @@
 # ============================================================================
-# SPIKE Prime 最強ライントレーサー  "LINE RACER"  (Pybricks 用)
+# SPIKE Prime 最強ライントレーサー  "LINE RACER"  v1.1.0  (Pybricks 用)
 # ----------------------------------------------------------------------------
 # 概要:
 #   1周目 = エクスプローララン(中速で完走し、弧長s基準で曲率マップ/誤差プロファイルを記録)
@@ -7,9 +7,13 @@
 #   スタートの「垂直な2本線」をゲートとして検出し、ラップタイムを計測・ベスト記録
 #   無限周回し、ベストタイムを 5x5 ライトマトリクスと USB コンソールに出力
 #
+# v1.1.0 (2026-08): ブームD項正帰還で KD を無効化 / ホイール定数を円周(π誤差)修正 +
+#   起動時スピンキャリブレーション / トレッド16cm(20ポッチ) / Pybricks で動かない
+#   bytearray スライス代入を一掃 / ロスト中・探索速度を安全側に
+#
 # ハードウェア (デフォルト配線):
-#   Port A: 左モーター      Port B: 右モーター
-#   Port C: 左カラーセンサー Port D: 右カラーセンサー (ラインを挟む差動配置)
+#   Port A: 左モーター      Port E: 右モーター
+#   Port B: 左カラーセンサー Port F: 右カラーセンサー (ラインを挟む差動配置)
 #
 # 使い方:
 #   Pybricks Code でこのファイルを開き、ハブに書き込んで実行。
@@ -45,13 +49,22 @@ from math import sqrt as _fsqrt
 # ============================================================================
 
 # ---- 機体 ----------------------------------------------------------------
-WHEEL_D_CM = 27.9       # ホイール直径 cm (転がり試験で実測推奨: 10回転の移動距離/10/pi)
-TRACK_B_CM = 14.0       # 左右駆動輪のトレッド幅 cm (曲率フィードフォワード用)
+# ホイール円周 WHEEL_D_CM=27.9cm (SPIKE Prime 大タイヤ φ8.88cm)。
+# 転がり試験で実測: 10回転の移動距離 ÷ 10 = 円周。
+# ※ 以前「直径27.9cm」誤記載で速度・オドメトリが実値の π 倍ずれた。
+WHEEL_D_CM = 27.9       # ホイール円周 cm (= 直径 8.88cm × π)
+TRACK_B_CM = 16.0       # 左右駆動輪のトレッド幅 cm (実測20ポッチ=16cm。κFF/スリップ判定用)
 BOOM_K = 200            # センサーブーム輸送遅延補償 (×1000, 0.2 = 200)。0で無効
+VERSION = "1.1.0"       # バージョン (起動ログ・ダンプヘッダに表示)
+# ホイール変換係数 (起動時スピンキャリブレーションで微調整):
+#   deg_s = cm/s * WMUL / 100  … WMUL=1290 は円周27.9cm に対応
+#   cm    = deg * SMUL / 10000 … SMUL=775 は円周27.9cm に対応
+WMUL = 1290
+SMUL = 775
 PORT_LM = Port.A        # 左モーター
-PORT_RM = Port.B        # 右モーター
-PORT_LS = Port.C        # 左カラーセンサー (ラインの左)
-PORT_RS = Port.D        # 右カラーセンサー (ラインの右)
+PORT_RM = Port.E        # 右モーター
+PORT_LS = Port.B        # 左カラーセンサー (ラインの左)
+PORT_RS = Port.F        # 右カラーセンサー (ラインの右)
 
 # ---- 符号 (逆だと暴走。初回セットアップで要確認) ---------------------------
 SIGN_ST = 1             # ステアリング: e<0(ラインが右)で右に曲がる = +1
@@ -60,7 +73,12 @@ SIGN_BOOM = 1           # ブーム補償符号
 
 # ---- 制御ゲイン (e は ±1000 正規化誤差) -----------------------------------
 KP = 90                 # 比例: cm/s per (1000 e)  ... st_P = KP*e/1000
-KD = 30                 # 微分: cm/s per (1000 e/s) ... st_D = KD*de/1000
+# KD=0: センサーが旋回中心から前方 L=16cm にあると、旋回中のブーム振れが
+# e の微分(de)に強く現れ、D項が旋回を打ち消すどころか増強する正帰還になる
+# (閉ループsim: KD=30→osc=2072/m, KD=0→osc=1/m, 実機症状と一致)。κFF/ILC/
+# ジャイロ減衰がコーナリングを担うので D項は不要。ブームを 5cm 以下に
+# 短縮した場合のみ KD=10 前後に戻すこと。
+KD = 0                  # 微分: cm/s per (1000 e/s) ... st_D = KD*de/1000
 KI = 40                 # 積分: cm/s per (1000 e*s) ... st_I = KI*intg/1000000
 GYRO = 300              # ジャイロ: cm/s per 1000 mdeg/s 差分 ... st_G = GYRO*dw/1000000
 INTG_LIMIT = 250000     # 積分アンチワインドアップ (e*ms)
@@ -68,10 +86,12 @@ ST_MAX = 150            # ステアリング出力クランプ cm/s
 FF_MAX = 150            # ILC フィードフォワード クランプ cm/s
 
 # ---- 速度 ----------------------------------------------------------------
-V_FIND = 30             # ゲート探索時速度 cm/s
-V_LAP1 = 40             # 1周目(エクスプローラ)速度 cm/s
+V_FIND = 25             # ゲート探索時速度 cm/s (安全側)
+V_LAP1 = 35             # 1周目(エクスプローラ)速度 cm/s (安全側)
 V_MIN = 12              # 最低速度 cm/s
-V_MAX_INIT = 65         # 速度上限の初期値 cm/s (ラップ2の安全な出発点、良好ラップで+4成長)
+V_MAX_INIT = 50         # 速度上限の初期値 cm/s (ラップ2の控えめな出発点。
+                        # ブーム長16cm だと高速度は安定余裕を失いやすいため 65→50 に。
+                        # 良好ラップで +4cm/s/周 ずつ成長し MOTOR_MAX で頭打ち)
 MOTOR_MAX = 140         # 実測最高速の目安 cm/s (ホイールを浮かせて実測し設定)
 HARD_MAX = 250          # 安全リミット cm/s (モーター指令クランプ)
 A_ACC = 220             # 加速リミット cm/s^2
@@ -85,7 +105,10 @@ ILC_ALPHA_HI = 60        # ILC 学習率 ×1000 (誤差大のとき。0.06)
 ILC_ALPHA_MID = 40       # ILC 学習率 ×1000 (通常。0.04。収束を速める)
 ILC_ALPHA_LO = 25        # ILC 学習率 ×1000 (収束時。0.025)
 KP_MIN, KP_MAX = 30, 160
-KD_MIN, KD_MAX = 5, 80
+# KD_MIN=0: 下限が >0 だと適応学習(KD_cur<KD_MIN のクランプ)が KD=0 を
+# 即座に復活させ、ブーム正帰還で再発振する。発振時の KD増強も 0 のまま
+# 発揮できないので、発振対処は KP 減で行う設計。
+KD_MIN, KD_MAX = 0, 80
 GATE_DIP = 45            # ゲート手前の減速速度 cm/s
 GATE_DIP_CM = 30         # ゲート手前で減速する距離 cm (読み飛ばし防止)
 ROLLBACK_MARGIN = 103    # ベスト比でこの%を超えると「悪化」 (×100)
@@ -130,9 +153,10 @@ GATE_MISS_CM = 300      # この距離過ぎても未検出なら「読み飛ば
 BATT_NOM = 7600         # 基準電圧 mV (2S Li-ion 公称)
 COMP_MAX = 1300         # 補償率上限 ×1000 (1.3)
 
-# ---- 起動時自動テスト (符号・モーター方向) --------------------------------
+# ---- 起動時自動テスト (符号・モーター方向・ホイール円周) --------------------
 TEST_SPEED = 120        # テスト時のモーター速度 deg/s (~30cm/s)
 TEST_MS = 300           # テスト1回の時間 ms
+CAL_MS = 800            # ホイール円周キャリブレーション旋回の時間 ms/方向
 TEST_ACC_TH = 200       # 前進テストの判定閾値 mm/s (加速度積分)
 
 # ---- ディスプレイ/ブザー --------------------------------------------------
@@ -228,23 +252,25 @@ def i16set(ba, i, v):
 
 
 def i32at(ba, i):
-    j = i * 4
-    v = ba[j] | (ba[j + 1] << 8) | (ba[j + 2] << 16) | (ba[j + 3] << 24)
-    if v >= 0x80000000:
-        v -= 0x100000000
-    return v
+    # Pybricks は Small Int (±2^30) のみ: <<24 や 2^32 リテラルは OverflowError になる。
+    # i32 slot i はバイト [4i,4i+3] = u16@slot(2i) + i16@slot(2i+1)。
+    j = i * 2
+    lo = u16at(ba, j)
+    hi = i16at(ba, j + 1)
+    return hi * 65536 + lo
+
+
+def i32set(ba, i, v):
+    j = i * 2
+    i16set(ba, j, v & 0xFFFF)
+    i16set(ba, j + 1, (v >> 16) & 0xFFFF)
 
 
 def i32add(ba, i, v):
-    j = i * 4
-    x = ba[j] | (ba[j + 1] << 8) | (ba[j + 2] << 16) | (ba[j + 3] << 24)
-    if x >= 0x80000000:
-        x -= 0x100000000
-    x += v
-    ba[j] = x & 255
-    ba[j + 1] = (x >> 8) & 255
-    ba[j + 2] = (x >> 16) & 255
-    ba[j + 3] = (x >> 24) & 255
+    # (v>>16) は算術シフトなので負値もそのまま i16 の2の補数形式で保存できる。
+    x = i32at(ba, i) + v
+    i16set(ba, i * 2, x & 0xFFFF)
+    i16set(ba, i * 2 + 1, (x >> 16) & 0xFFFF)
 
 
 def u16at(ba, i):
@@ -260,6 +286,20 @@ def u16add(ba, i, v):
         x = 65535
     ba[j] = x & 255
     ba[j + 1] = (x >> 8) & 255
+
+
+def ba_clear(ba, n):
+    """bytearray を先頭 n バイト 0 埋め。
+    Pybricks の MicroPython ではスライス代入が TypeError になるため要素ループで行う
+    (スライス代入は CPython では通ってしまうので PC テストでは検出できない罠)。"""
+    for i in range(n):
+        ba[i] = 0
+
+
+def ba_copy(dst, src, n):
+    """dst ← src を先頭 n バイトコピー (スライス代入を避けるためループで)。"""
+    for i in range(n):
+        dst[i] = src[i]
 
 
 def percentile(hist, p):
@@ -400,7 +440,7 @@ def calib_stationary():
             histL[rl] += 1
         if histR[rr] < 60000:
             histR[rr] += 1
-        wzb += hub.imu.angular_velocity(Axis.Z)
+        wzb += int(hub.imu.angular_velocity(Axis.Z) * 1000)   # float deg/s → int mdeg/s
         n += 1
     wz_bias = wzb // max(n, 1)
     print("calib: bias=%d n=%d" % (wz_bias, n))
@@ -506,17 +546,19 @@ def _tick_impl(dt_ms, t_ms):
     if SIGN_ST < 0:
         e = -e
 
-    # ジャイロ (mdeg/s、符号は起動時自動テストで確定)
-    wz = hub.imu.angular_velocity(Axis.Z) - wz_bias
+    # ジャイロ: Pybricks は deg/s で float を返す。mdeg/s の int に変換してから
+    # 使う (下流の定数 57296/17453/5000 はすべて mdeg/s 前提。float のままだと
+    # // が float を返し、& 演算は TypeError になる)
+    wz = int(hub.imu.angular_velocity(Axis.Z) * 1000) - wz_bias
     if SIGN_GYRO_CUR < 0:
         wz = -wz
 
     # オドメトリ (CMD_FLIP でモーター方向を補正)
     aL = mL.angle() * CMD_FLIP
     aR = mR.angle() * CMD_FLIP
-    # s_cm = 平均角 * pi*D/360 [cm]。pi*27.9/360 = 0.2435 → ×1000 = 244
+    # s_cm = 平均角 * 円周/360 [cm]。円周27.9cm/360 = 0.0775 cm/deg → SMUL=775
     # (毎ティックの角度差は高ループレートで分解能未満のため速度推定には使わない)
-    s_cm = ((aL + aR) // 2 - s_base_deg) * 244 // 1000
+    s_cm = ((aL + aR) // 2 - s_base_deg) * SMUL // 10000
     # 注意: 毎ティックの ds は高ループレート(>40Hz)では分解能未満で常に0になり、
     #   エンコーダ実測速度(EMA)はほぼ0になる。κ/ブーム補償は指令速度 v_cmd を使う
     #   (FF/wref も v_cmd 基準なので自己整合する)
@@ -568,8 +610,8 @@ def _tick_impl(dt_ms, t_ms):
     st = 0
     if in_lap and track_len > 0 and not slow_mode:
         # 幾何学的曲率FF: st = (vR-vL)/2 = κ*v*B/2 [cm/s]
-        # B=14cm: st = (k1000/1000)*v*14/2 = k1000*v*7/100000
-        st += ((k1000 * 7000) // 100000) * v_cmd // 1000
+        # B=16cm: st = (k1000/1000)*v*16/2 = k1000*v*8/100000
+        st += ((k1000 * 8000) // 100000) * v_cmd // 1000
         # ILC 学習FF (v=100cm/s 基準で保存 → 現在速度でスケーリング)
         st += ffb * v_cmd // 100
     else:
@@ -593,15 +635,16 @@ def _tick_impl(dt_ms, t_ms):
     # ジャイロダンピング (目標ヨーレート wref = v*κ [mdeg/s])
     # 注意: 単位は mdeg/s。κ[1/m]=k1000/1000, v[cm/s]=v_cmd/100 [m/s]
     #   wref = κ*v*57296 = k1000*v_cmd*57296/100000
-    #   → (k1000*57296//1000)*v_cmd//100 で32bit範囲内・精度保持
+    #   → (k1000*57296//1000) は |k1000|>=18741 で Pybricks Small Int(±2^30) を
+    #     超えるため、整除性を保つ恒等変形 k*57+(k*296)//1000 で回避する
     if in_lap and track_len > 0 and not slow_mode:
-        wref = (k1000 * 57296 // 1000) * v_cmd // 100
+        wref = (k1000 * 57 + k1000 * 296 // 1000) * v_cmd // 100
     else:
         wref = 0
     dw = wref - wz
     # ラップ1/ゲート探索はマップ未学習のため wref=0 → 純減衰がカーブと戦う。
-    # GYRO を半減し、定常誤差(→κマップ過小評価)とカーブ出口オーバーシュートを抑える
-    gyr = GYRO // 2 if lap_no <= 1 else GYRO
+    # 安定性優先で最初からフル GYRO を効かせる (κマップの歪みは ILC が補正)
+    gyr = GYRO
     st += (dw * gyr) // 1000000
 
     if st > ST_MAX:
@@ -684,12 +727,12 @@ def _tick_impl(dt_ms, t_ms):
         vR = HARD_MAX
     elif vR < -HARD_MAX:
         vR = -HARD_MAX
-    mL.run(vL * 411 // 100 * CMD_FLIP)
-    mR.run(vR * 411 // 100 * CMD_FLIP)
+    mL.run(vL * WMUL // 100 * CMD_FLIP)
+    mR.run(vR * WMUL // 100 * CMD_FLIP)
 
     # スリップ検出: 指令ωと実測ωの乖離 (コーナリング時のみ)
     if in_lap and lap_valid and not slow_mode:
-        wcmd = (vR - vL) * 57296 // 14   # 指令ヨーレート mdeg/s (B=14cm)
+        wcmd = (vR - vL) * 57296 // 16   # 指令ヨーレート mdeg/s (B=16cm)
         if wcmd > 20000 or wcmd < -20000:
             if abs(wz - wcmd) > abs(wcmd) * SLIP_THRESH // 100:
                 slip_cnt += 1
@@ -959,9 +1002,9 @@ def lap_stats():
 # ============================================================================
 
 def smooth_i16(ba, half):
-    """±half ビンの箱型平滑化 (in-place)"""
-    tmp = bytearray(len(ba))
+    """±half ビンの箱型平滑化 (in-place に出力)"""
     n = len(ba) // 2
+    tmp = bytearray(len(ba))
     for i in range(n):
         acc = 0
         c = 0
@@ -970,11 +1013,11 @@ def smooth_i16(ba, half):
                 acc += i16at(ba, j)
                 c += 1
         i16set(tmp, i, acc // c)
-    ba[:] = tmp
+    ba_copy(ba, tmp, n * 2)
 
 
 def smooth_u8(ba, half):
-    """±half ビンの箱型平滑化 (u8, in-place)"""
+    """±half ビンの箱型平滑化 (u8, in-place に出力)"""
     tmp = bytearray(len(ba))
     n = len(ba)
     for i in range(n):
@@ -985,7 +1028,7 @@ def smooth_u8(ba, half):
                 acc += ba[j]
                 c += 1
         tmp[i] = acc // c
-    ba[:] = tmp
+    ba_copy(ba, tmp, n)
 
 
 def finalize_lap(t_lap):
@@ -1259,10 +1302,10 @@ def finalize_lap(t_lap):
     if best_time == 0 or t_lap < best_time:
         best_time = t_lap
         best_lap = lap_no
-        best_ff[:] = ff
-        best_vmax[:] = vmax
-        best_kp_mult[:] = kp_mult
-        best_kd_mult[:] = kd_mult
+        ba_copy(best_ff, ff, N_BINS * 2)
+        ba_copy(best_vmax, vmax, N_BINS)
+        ba_copy(best_kp_mult, kp_mult, N_SEC)
+        ba_copy(best_kd_mult, kd_mult, N_SEC)
         best_kp = KP_cur
         best_kd = KD_cur
         best_a_lat = A_LAT
@@ -1279,10 +1322,10 @@ def finalize_lap(t_lap):
         else:
             bad_streak = 0
         if lap_no > 2 and bad_streak >= BAD_STREAK:
-            ff[:] = best_ff
-            vmax[:] = best_vmax
-            kp_mult[:] = best_kp_mult
-            kd_mult[:] = best_kd_mult
+            ba_copy(ff, best_ff, N_BINS * 2)
+            ba_copy(vmax, best_vmax, N_BINS)
+            ba_copy(kp_mult, best_kp_mult, N_SEC)
+            ba_copy(kd_mult, best_kd_mult, N_SEC)
             KP_cur = best_kp
             KD_cur = best_kd
             A_LAT = best_a_lat
@@ -1397,14 +1440,14 @@ def reset_lap_state():
     n_min_prev = 1000
     t_prev = sw.time()
     s_base_deg = (mL.angle() + mR.angle()) // 2 * CMD_FLIP
-    kappa_acc[:] = ZERO4
-    kappa_cnt[:] = ZERO1
-    err_sum[:] = ZERO2
-    err_cnt[:] = ZERO1
-    vsum_bin[:] = ZERO2
-    sec_zc[:] = b"\x00" * (N_SEC * 2)
-    sec_esum[:] = b"\x00" * (N_SEC * 4)
-    sec_cnt[:] = b"\x00" * (N_SEC * 2)
+    ba_clear(kappa_acc, N_BINS * 4)
+    ba_clear(kappa_cnt, N_BINS)
+    ba_clear(err_sum, N_BINS * 2)
+    ba_clear(err_cnt, N_BINS)
+    ba_clear(vsum_bin, N_BINS * 2)
+    ba_clear(sec_zc, N_SEC * 2)
+    ba_clear(sec_esum, N_SEC * 4)
+    ba_clear(sec_cnt, N_SEC * 2)
     histL[:] = [0] * 101
     histR[:] = [0] * 101
 
@@ -1425,8 +1468,8 @@ def check_devices():
 
 
 def auto_sign_test():
-    """起動時: モーター方向(CMD_FLIP)とジャイロ符号(SIGN_GYRO)を自動判定"""
-    global CMD_FLIP, SIGN_GYRO_CUR
+    """起動時: CMD_FLIP / SIGN_GYRO の自動判定とホイール円周の実測"""
+    global CMD_FLIP, SIGN_GYRO_CUR, WMUL, SMUL
     print("auto sign test - keep clear space around robot")
     # 1) 前進/後退テスト (加速度積分の差で方向判定、重力オフセットは差で相殺)
     a_plus = 0
@@ -1460,7 +1503,7 @@ def auto_sign_test():
     while sw.time() - t0 < TEST_MS:
         mL.run(-TEST_SPEED * CMD_FLIP)
         mR.run(TEST_SPEED * CMD_FLIP)
-        w1 += hub.imu.angular_velocity(Axis.Z)
+        w1 += int(hub.imu.angular_velocity(Axis.Z) * 1000)
         n1 += 1
         wait(2)
     w2 = 0
@@ -1469,7 +1512,7 @@ def auto_sign_test():
     while sw.time() - t0 < TEST_MS:
         mL.run(TEST_SPEED * CMD_FLIP)
         mR.run(-TEST_SPEED * CMD_FLIP)
-        w2 += hub.imu.angular_velocity(Axis.Z)
+        w2 += int(hub.imu.angular_velocity(Axis.Z) * 1000)
         n2 += 1
         wait(2)
     mL.run(0)
@@ -1484,6 +1527,51 @@ def auto_sign_test():
         print("WARN: spin test ambiguous (w1=%d w2=%d) - using defaults" % (w1, w2))
         return
     print("sign test: CMD_FLIP=%d SIGN_GYRO=%d" % (CMD_FLIP, SIGN_GYRO_CUR))
+    # 3) ホイール円周キャリブレーション (その場旋回)
+    # 1輪の移動弧 = (B/2)*θ = (φ/360)*C → C[cm] = B*θ[deg]*π/φ
+    # 値は C*100 で持つ: (B*10)*θ*31416/(1000*φ)
+    #    ジャイロ積分 θ (バイアス除去済み) とホイール回転角 φ から円周を実測する。
+    #    滑りで過小評価しがちなので、±20% 内のときだけ±15%にクランプして採用。
+    c100_sum = 0
+    c100_n = 0
+    for mdir in (1, -1):
+        aL0 = mL.angle()
+        aR0 = mR.angle()
+        wsum = 0
+        t0 = sw.time()
+        while sw.time() - t0 < CAL_MS:
+            mL.run(-TEST_SPEED * CMD_FLIP * mdir)
+            mR.run(TEST_SPEED * CMD_FLIP * mdir)
+            wsum += int(hub.imu.angular_velocity(Axis.Z) * 1000) - wz_bias
+            wait(2)
+        mL.run(0)
+        mR.run(0)
+        th_deg = abs(wsum) // 1000
+        phi = (abs(mL.angle() - aL0) + abs(mR.angle() - aR0)) // 2
+        if th_deg >= 15 and phi >= 40:
+            c100_sum += (int(TRACK_B_CM * 10) * th_deg * 31416) // (1000 * phi)
+            c100_n += 1
+    if c100_n > 0:
+        c_avg = c100_sum // c100_n
+        if 2200 <= c_avg <= 3350:      # 実測 22.0〜33.5cm のみ採用
+            f1000 = 2790000 // c_avg   # 27.9cm との比 ×1000
+            WMUL = 1290 * f1000 // 1000
+            SMUL = 775 * f1000 // 1000
+            if WMUL > 1500:
+                WMUL = 1500
+            elif WMUL < 1100:
+                WMUL = 1100
+            if SMUL > 900:
+                SMUL = 900
+            elif SMUL < 660:
+                SMUL = 660
+        else:
+            print("WARN: wheel cal out of range (C=%d.%dcm) - keeping 27.9cm"
+                  % (c_avg // 100, c_avg // 10 % 10))
+            return
+        print("wheel cal: C=%d.%dcm WMUL=%d SMUL=%d" % (c_avg // 100, c_avg // 10 % 10, WMUL, SMUL))
+    else:
+        print("WARN: wheel cal did not measure (gyro/angle too small)")
 
 
 def wait_for_start():
@@ -1560,7 +1648,7 @@ def run_laps():
 
 
 def main():
-    print("=== SPIKE LINE RACER ===")
+    print("=== SPIKE LINE RACER v%s ===" % VERSION)
     mem_info()
     hub.system.set_stop_button((Button.CENTER, Button.LEFT, Button.RIGHT))
     hub.display.off()

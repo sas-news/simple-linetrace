@@ -1,1 +1,4 @@
 /__pycache__
+/.venv/
+/.omo/
+/.python-version

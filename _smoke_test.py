@@ -23,7 +23,7 @@ import sys
 # ============================================================================
 
 LAP_LEN = 1200.0       # コース長 cm (ゲート周期)
-TRACK_B_SIM = 14.0     # トレッド幅 cm (姿勢モデル用)
+TRACK_B_SIM = 16.0     # トレッド幅 cm (姿勢モデル用、実機20ポッチ=16cmと同期)
 SENSOR_OFF = 3.0       # センサーのライン中心からの横オフセット cm
 
 
@@ -58,7 +58,7 @@ class _Motor:
 def _pos_cm():
     """モータ平均角から絶対位置 (cm) を推定 (main.py のオドメトリと同式)"""
     a = (SIM.motors[0].angle_deg + SIM.motors[1].angle_deg) / 2.0
-    return a * 244.0 / 1000.0
+    return a * 775.0 / 10000.0
 
 
 def _sensor_val(dist):
@@ -72,7 +72,8 @@ def _sensor_val(dist):
 
 class _Sensor:
     def __init__(self, port):
-        self.side = "L" if str(port).endswith("C") else "R"
+        # main.py の PORT_LS/PORT_RS と同期 (現在: 左=B / 右=F、旧: 左=C / 右=D)
+        self.side = "L" if str(port) in ("B", "C") else "R"
 
     def reflection(self):
         x = _pos_cm()
@@ -89,6 +90,8 @@ class _Sensor:
 
 class _IMU:
     def angular_velocity(self, axis):
+        # 実機 Pybricks は deg/s の float を返す。main.py 側で int(値*1000) と
+        # mdeg/s に変換するため、ここも deg/s の float を返す (内部計算は mdeg/s)。
         x = _pos_cm()
         xm = x % LAP_LEN
         if 200.0 <= xm < 300.0:
@@ -97,13 +100,13 @@ class _IMU:
             k = -2000.0                   # カーブ2 (逆方向)
         else:
             k = 0.0
-        # 中心速度基準: wz = κ*v*57296/100000 (v = 両輪の平均)
+        # 中心速度基準: mdeg/s = κ*v*57296/100000 (v = 両輪の平均)→ deg/s で返す
         # 左輪だけを使うとステアリング中に κ が歪む (系統誤差になる)
-        v_cm = ((SIM.motors[0].speed + SIM.motors[1].speed) / 2.0) * 100.0 / 411.0
-        return int(k * v_cm * 57296 / 100000)
+        v_cm = ((SIM.motors[0].speed + SIM.motors[1].speed) / 2.0) * 100.0 / 1290.0
+        return (k * v_cm * 57296 / 100000) / 1000.0
 
     def acceleration(self, axis):
-        return 0
+        return 0.0
 
 
 class _Battery:
@@ -172,7 +175,7 @@ def _wait(ms):
 
 # ---- パラメータモック ----
 class _Port:
-    A, B, C, D = "A", "B", "C", "D"
+    A, B, C, D, E, F = "A", "B", "C", "D", "E", "F"
 
 
 class _Dir:
@@ -231,8 +234,8 @@ def advance(dt_ms):
     """モータ位置・姿勢を進める (tick の後に呼ぶ)"""
     M.mL._advance(dt_ms)
     M.mR._advance(dt_ms)
-    vL = M.mL.speed * 100.0 / 411.0        # deg/s → cm/s
-    vR = M.mR.speed * 100.0 / 411.0
+    vL = M.mL.speed * 100.0 / 1290.0        # deg/s → cm/s (円周27.9cm)
+    vR = M.mR.speed * 100.0 / 1290.0
     v = (vL + vR) / 2.0
     omega = (vR - vL) / TRACK_B_SIM        # rad/s
     SIM.head += omega * dt_ms / 1000.0

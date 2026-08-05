@@ -18,23 +18,25 @@ def i16set(ba, i, v):
 
 
 def i32at(ba, i):
-    j = i * 4
-    v = ba[j] | (ba[j + 1] << 8) | (ba[j + 2] << 16) | (ba[j + 3] << 24)
-    if v >= 0x80000000:
-        v -= 0x100000000
-    return v
+    # main.py と同一ロジック。Pybricks は Small Int (±2^30) のみのため、
+    # <<24 / 2^32 リテラルは使わず u16+i16 分解で組み立てる。
+    # i32 slot i はバイト [4i,4i+3] = u16@slot(2i) + i16@slot(2i+1)。
+    j = i * 2
+    lo = u16at(ba, j)
+    hi = i16at(ba, j + 1)
+    return hi * 65536 + lo
+
+
+def i32set(ba, i, v):
+    j = i * 2
+    i16set(ba, j, v & 0xFFFF)
+    i16set(ba, j + 1, (v >> 16) & 0xFFFF)
 
 
 def i32add(ba, i, v):
-    j = i * 4
-    x = ba[j] | (ba[j + 1] << 8) | (ba[j + 2] << 16) | (ba[j + 3] << 24)
-    if x >= 0x80000000:
-        x -= 0x100000000
-    x += v
-    ba[j] = x & 255
-    ba[j + 1] = (x >> 8) & 255
-    ba[j + 2] = (x >> 16) & 255
-    ba[j + 3] = (x >> 24) & 255
+    x = i32at(ba, i) + v
+    i16set(ba, i * 2, x & 0xFFFF)
+    i16set(ba, i * 2 + 1, (x >> 16) & 0xFFFF)
 
 
 def percentile(hist, p):
@@ -139,16 +141,28 @@ ba16 = bytearray(10 * 2)
 for v in [0, 1, -1, 32767, -32768, 12345, -12345, 200, -200]:
     i16set(ba16, 3, v)
     assert i16at(ba16, 3) == v, "i16 roundtrip %d -> %d" % (v, i16at(ba16, 3))
+# i32 は Pybricks Small Int 上限 (±2^30-1) 内でラウンドトリップ検証
 ba32 = bytearray(10 * 4)
-for v in [0, 1, -1, 2147483647, -2147483648, 123456789, -987654321]:
-    ba32[8:12] = b"\x00\x00\x00\x00"
-    i32add(ba32, 2, v)
+for v in [0, 1, -1, 1073741823, -1073741824, 65535, 65536, -65536,
+          16777216, -16777216, 123456789, -987654321]:
+    i32set(ba32, 2, v)
     assert i32at(ba32, 2) == v, "i32 set %d -> %d" % (v, i32at(ba32, 2))
-ba32[8:12] = b"\x00\x00\x00\x00"
+    i32set(ba32, 2, 0)
 i32add(ba32, 2, 123456789)
 i32add(ba32, 2, 100)
 i32add(ba32, 2, -100)
 assert i32at(ba32, 2) == 123456789
+# 負の累積 (κ の両符号) と上位バイト境界 (符号ビット) の検証
+i32set(ba32, 2, 0)
+i32add(ba32, 2, -34906)
+i32add(ba32, 2, -34906)
+assert i32at(ba32, 2) == -69812, "i32 negative acc -> %d" % i32at(ba32, 2)
+assert ba32[8 + 3] >= 0x80, "neg acc top byte should be sign-extended"
+# 隣接スロット独立性: slot0 と slot1 が重なると (x2 二重適用バグ) 値が混ざる
+i32set(ba32, 0, 0x11111111)
+i32set(ba32, 1, 0x22222222)
+assert i32at(ba32, 0) == 0x11111111, "slot0 汚染: %08x" % i32at(ba32, 0)
+assert i32at(ba32, 1) == 0x22222222, "slot1 汚染: %08x" % i32at(ba32, 1)
 print("PASS i16/i32 roundtrip")
 
 # ---- テスト2: パーセンタイル ----
@@ -224,19 +238,19 @@ assert abs(k1000_est - 2000) < 100, k1000_est
 #   (k1000*57296//1000)*v//100 は32bit範囲内で精度保持
 wref = (k1000_est * 57296 // 1000) * v // 100
 assert abs(wref - 114592) < 200, wref
-# 曲率FF: st = (vR-vL)/2 = κ*v*B/2。B=14cm, κ=2/m, v=100cm/s なら
-#   st = 2*1[m/s]*0.14[m]/2 = 0.14m/s = 14cm/s
-#   定数7000: (k1000*7000//100000)*v//1000 = 2000*7000//100000*100//1000 = 14
-st_ff = ((k1000_est * 7000) // 100000) * v // 1000
-assert abs(st_ff - 14) < 2, st_ff
+# 曲率FF: st = (vR-vL)/2 = κ*v*B/2。B=16cm, κ=2/m, v=100cm/s なら
+#   st = 2*1[m/s]*0.16[m]/2 = 0.16m/s = 16cm/s
+#   定数8000: (k1000*8000//100000)*v//1000 = 2000*8000//100000*100//1000 = 16
+st_ff = ((k1000_est * 8000) // 100000) * v // 1000
+assert abs(st_ff - 16) < 2, st_ff
 print("PASS units: kappa_est=%d wref=%d st_ff=%d" % (k1000_est, wref, st_ff))
 
-# ---- テスト6b: スリップ判定の指令ヨーレート (B=14cm、mdeg/s) ----
-# ω = (vR-vL)/B [rad/s] → mdeg/s = *57296。÷14 (÷140 は10倍過小 → スリップ過検出)
-vR, vL = 80, 20   # 速度差 60cm/s → 60/14*57296 ≈ 245,554 mdeg/s
-wcmd = (vR - vL) * 57296 // 14
-assert abs(wcmd - 245554) < 200, wcmd
-wcmd_bad = (vR - vL) * 57296 // 140
+# ---- テスト6b: スリップ判定の指令ヨーレート (B=16cm、mdeg/s) ----
+# ω = (vR-vL)/B [rad/s] → mdeg/s = *57296。÷16 (÷160 は10倍過小 → スリップ過検出)
+vR, vL = 80, 20   # 速度差 60cm/s → 60/16*57296 ≈ 214,860 mdeg/s
+wcmd = (vR - vL) * 57296 // 16
+assert abs(wcmd - 214860) < 200, wcmd
+wcmd_bad = (vR - vL) * 57296 // 160
 assert wcmd_bad < wcmd // 9
 print("PASS slip yaw-rate units (wcmd=%d)" % wcmd)
 
@@ -436,14 +450,18 @@ _run_src = _src[_src.index("def run_laps"):]
 assert "global lap_done" in _run_src, "run_laps に global lap_done が無い"
 
 # スリップ判定は 57296//14 (mdeg/s)。//140 は10倍過小でスリップ過検出のバグ
-assert "57296 // 14" in _src and "57296 // 140" not in _src, "スリップ判定の ÷140 バグ再発"
+assert "57296 // 16" in _src and "57296 // 160" not in _src, "スリップ判定の ÷160 バグ再発"
 
 # 目標ヨーレート wref は正しい式 (1000倍過小の旧式が無いこと)
 _tick_src = _src[_src.index("def _tick_impl"):]
-assert "(k1000 * 57296 // 1000) * v_cmd // 100" in _tick_src, "wref 式が誤っている"
+# オーバーフロー回避の恒等変形 (k*57296)//1000 = k*57+(k*296)//1000。
+# 旧式 (k1000*57296//1000) は |k1000|>=18741 で Pybricks Small Int(±2^30) を超える。
+_wref_ok = "k1000 * 57 + k1000 * 296 // 1000" in _tick_src
+_wref_no_old = "(k1000 * 57296 // 1000) * v_cmd // 100" not in _tick_src
+assert _wref_ok and _wref_no_old, "wref 式がオーバーフロー旧式に戻っている"
 # 曲率FF は 7000 (2倍過大の旧式 14000 が無いこと)
-assert "k1000 * 7000" in _tick_src, "曲率FF 定数が誤っている"
-assert "k1000 * 14000" not in _tick_src, "曲率FF の 2倍過大バグ再発"
+assert "k1000 * 8000" in _tick_src, "曲率FF 定数が誤っている"
+assert "k1000 * 16000" not in _tick_src, "曲率FF の 2倍過大バグ再発"
 # finalize_lap が best_kp 等を global 宣言していること (無いとロールバックで落ちる)
 _fin2 = _src[_src.index("def finalize_lap"):_src.index("def reset_lap_state")]
 assert "global best_kp, best_kd, best_a_lat, best_vglob" in _fin2, \
@@ -455,8 +473,9 @@ assert "nL > 850 and nR > 850" not in _tick_src, "ロスト判定の両方白バ
 # ゲートマッチャーは両センサ同時黒 (line_both) で駆動する (蛇行誤検出対策)
 assert "line_both = (nL < 500) and (nR < 500)" in _tick_src, "line_both 定義が無い"
 assert "matcher_tick(s_cm, mat_sig)" in _tick_src, "マッチャーが mat_sig を使っていない"
-# ラップ1はマップ未学習のため GYRO 半減 (純減衰がカーブと戦う問題)
-assert "GYRO // 2 if lap_no <= 1" in _tick_src, "ラップ1の GYRO 半減が無い"
+# ジャイロ減衰はフル GYRO (ラップ1の半減は取りやめ: 安定性優先)
+assert "gyr = GYRO" in _tick_src, "ジャイロ減衰ガインが GYRO でない"
+assert "GYRO // 2" not in _tick_src, "ラップ1の GYRO 半減が復活している"
 
 # vmax 再構築: vc>255 クランプ (無いと bytearray 代入で finalize_lap が落ちる)
 _fin_src = _src[_src.index("def finalize_lap"):]
@@ -468,6 +487,44 @@ assert "de_f = 0" in _src[_src.index("def reset_lap_state"):], "de_f のリセ�
 # v_meas が tick に残っていると κ 過大評価バグが再発する
 assert "v_meas" not in _tick_src, "tick に v_meas が残っている (κ過大評価バグ再発)"
 assert "wz // max(v_cmd, 5)" in _tick_src, "κ蓄積が v_cmd 基準でない"
+# i32 ヘルパー: 2^32 リテラル / <<24 の中間超過は Pybricks で OverflowError になる。
+# u16+i16 分解実装 (i32set 存在 + 0x80000000/0x100000000 不在) をソース文字列で確認する。
+assert "def i32set" in _src, "i32set が無い (i32 は分解書き込みであるべき)"
+assert "0x80000000" not in _src and "0x100000000" not in _src, \
+    "i32 ヘルパーに 2^31/2^32 リテラル再発 (Pybricks で OverflowError)"
+_i32_src = _src[_src.index("def i32at"):_src.index("def percentile")]
+assert "<< 24" not in _i32_src, "i32at/i32add に 4byte シフト再発 (Small Int 超過)"
+
+# ---- テスト18b: ブームD項正帰還とホイールπ誤差の回帰ガード ----
+# センサー前方16cm では D 項(de)がブーム振れを正帰還して発振する
+# (閉ループsim: KD=30→osc=2072/m, KD=0→osc=1/m)。KD デフォルトと KD_MIN
+# 下限は 0 でなければならない (KD_MIN>0 は適応クランプが KD を復活させる)。
+assert "\nKD = 0" in _src, "KD デフォルトが 0 でない (ブームD項正帰還で発振)"
+assert "KD_MIN, KD_MAX = 0, 80" in _src, "KD_MIN 下限が 0 でない (KD=0 が復活する)"
+# ホイール定数: SPIKE Prime 大タイヤは 円周27.9cm (φ8.88cm)。
+# 直径27.9cm 前提の旧変換 (411/244) は速度・オドメトリが実値の π 倍ずれる。
+assert "WHEEL_D_CM = 27.9" in _src, "WHEEL_D_CM が 27.9 (円周) でない"
+assert "* WMUL // 100" in _tick_src, "モーター変換が WMUL (円周27.9cm基準) でない"
+assert "* SMUL // 10000" in _tick_src, "オドメトリ変換が SMUL (円周27.9cm基準) でない"
+assert "* 411 // 100" not in _tick_src, "旧モーター変換 (411, 直径27.9cm) 再発"
+assert "* 244 // 1000" not in _tick_src, "旧オドメトリ変換 (244, 直径27.9cm) 再発"
+# トレッド幅は実測 16cm (20ポッチ)。κFF 定数8000 / スリップ判定 //16 と一致する
+assert "TRACK_B_CM = 16.0" in _src, "TRACK_B_CM が 16.0 でない"
+assert "57296 // 16" in _src, "スリップ判定が B=16cm でない"
+# ---- テスト18c: Pybricks で動かない bytearray スライス代入の回帰ガード ----
+# MicroPython は ba[:] = ... のスライス代入に TypeError を投げる (CPython では
+# 通る罠。実機ではラップ開始の reset_lap_state が落ちた)。クリア/コピーは
+# ba_clear(ba,n) / ba_copy(dst,src,n) の要素ループで行うこと。
+assert "def ba_clear" in _src and "def ba_copy" in _src, "ba_clear/ba_copy が無い"
+for _bad in ("[:] = ZERO", "[:] = tmp", "best_ff[:", "best_vmax[:",
+             "best_kp_mult[:", "best_kd_mult[:", "ff[:]", "vmax[:] =",
+             "kp_mult[:] =", "kd_mult[:] =", "kappa_acc[:", "sec_zc[:"):
+    assert _bad not in _src, "bytearray スライス代入が復活している: %s" % _bad
+# 起動時スピンでホイール円周を実測し変換係数を更新するキャリブレーション
+assert "auto_sign_test" in _src
+assert "global CMD_FLIP, SIGN_GYRO_CUR, WMUL, SMUL" in _src, "円周キャリブレーションの global 宣言が無い"
+print("PASS boom-KD / wheel-pi regression guards")
+print("PASS bytearray-slice regression guards")
 print("PASS main.py source static checks")
 
 # ---- テスト19: D項の1次ローパス (ノイズ飽和対策) ----

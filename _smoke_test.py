@@ -153,12 +153,15 @@ class _Hub:
         self.buttons = _Buttons()   # hub.buttons.pressed() 用 (属性)
 
 
+_CLK = 0   # モック時計 (time() と wait() が共有。sim_loop も進める)
+
+
 class _StopWatch:
     def __init__(self):
         self.t = 0
 
     def time(self):
-        return int(self.t)
+        return int(_CLK)
 
 
 def _native(f):
@@ -170,7 +173,8 @@ def _mem_info(*a, **k):
 
 
 def _wait(ms):
-    pass
+    global _CLK
+    _CLK += ms
 
 
 # ---- パラメータモック ----
@@ -244,9 +248,10 @@ def advance(dt_ms):
 
 def sim_loop(cond, guard_limit, on_step):
     """cond() が True の間 tick を回す (find_gate / ラップ の共通ループ)"""
+    global _CLK
     guard = 0
     while cond() and guard < guard_limit:
-        M.sw.t += STEP_MS                  # 時計を固定周期で進める
+        _CLK += STEP_MS                # 時計を固定周期で進める
         t_ms = M.sw.time()
         dt = max(t_ms - M.t_prev, 1)
         M.t_prev = t_ms
@@ -304,6 +309,37 @@ def sim_laps(n_laps):
     print("laps done: %d, track=%d best=%d" % (M.lap_no, M.track_len, M.best_time))
 
 
+def sim_boot_sign_test():
+    """起動時自動テスト (符号判定 + ホイール円周キャリブレーション) が
+    クラッシュせず終了すること。ジャイロは実際のモーター速度差から模擬し、
+    スピンテスト→円周キャリブレーションの測定経路を通す (モックはホイール角が
+    進まないため「did not measure」の WARN 経路で終了する)。"""
+    print("-- boot sign test (no-crash) --")
+    M.CMD_FLIP = 1
+    M.SIGN_GYRO_CUR = 1
+    M.wz_bias = 0
+    M.WMUL = 1290
+    M.SMUL = 775
+
+    def fake_gyro(axis):
+        d = M.mR.speed - M.mL.speed     # スピン時の実ヨーレート (deg/s、符号付き)
+        if d > 0:
+            return 66.6
+        if d < 0:
+            return -66.6
+        return 0.0
+
+    M.hub.imu.angular_velocity = fake_gyro   # クラスメソッドをインスタンス属性で影
+    try:
+        M.auto_sign_test()
+    finally:
+        del M.hub.imu.angular_velocity
+    assert M.CMD_FLIP in (1, -1)
+    assert M.SIGN_GYRO_CUR in (1, -1)
+    print("boot sign test ok (CMD_FLIP=%d SIGN_GYRO=%d WMUL=%d)" %
+          (M.CMD_FLIP, M.SIGN_GYRO_CUR, M.WMUL))
+
+
 def sim_rollback():
     print("-- forced rollback --")
     M.best_time = 10000
@@ -340,6 +376,7 @@ def sim_gate_miss():
 
 def main():
     print("=== smoke test: main.py on PC (pybricks mocked) ===")
+    sim_boot_sign_test()
     sim_find_gate()
     sim_laps(6)
     sim_rollback()

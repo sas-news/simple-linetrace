@@ -1,5 +1,5 @@
 # ============================================================================
-# SPIKE Prime 最強ライントレーサー  "LINE RACER"  v1.1.0  (Pybricks 用)
+# SPIKE Prime 最強ライントレーサー  "LINE RACER"  v1.1.1  (Pybricks 用)
 # ----------------------------------------------------------------------------
 # 概要:
 #   1周目 = エクスプローララン(中速で完走し、弧長s基準で曲率マップ/誤差プロファイルを記録)
@@ -7,7 +7,8 @@
 #   スタートの「垂直な2本線」をゲートとして検出し、ラップタイムを計測・ベスト記録
 #   無限周回し、ベストタイムを 5x5 ライトマトリクスと USB コンソールに出力
 #
-# v1.1.0 (2026-08): ブームD項正帰還で KD を無効化 / ホイール定数を円周(π誤差)修正 +
+# v1.1.1 (2026-08): 起動時キャリブレーションの Small Int オーバーフローを修正
+#   (中間積を分割スケール化 + try/except で起動を保護)。続いて v1.1.0: ブームD項正帰還で KD を無効化 / ホイール定数を円周(π誤差)修正 +
 #   起動時スピンキャリブレーション / トレッド16cm(20ポッチ) / Pybricks で動かない
 #   bytearray スライス代入を一掃 / ロスト中・探索速度を安全側に
 #
@@ -55,7 +56,7 @@ from math import sqrt as _fsqrt
 WHEEL_D_CM = 27.9       # ホイール円周 cm (= 直径 8.88cm × π)
 TRACK_B_CM = 16.0       # 左右駆動輪のトレッド幅 cm (実測20ポッチ=16cm。κFF/スリップ判定用)
 BOOM_K = 200            # センサーブーム輸送遅延補償 (×1000, 0.2 = 200)。0で無効
-VERSION = "1.1.0"       # バージョン (起動ログ・ダンプヘッダに表示)
+VERSION = "1.1.1"       # バージョン (起動ログ・ダンプヘッダに表示)
 # ホイール変換係数 (起動時スピンキャリブレーションで微調整):
 #   deg_s = cm/s * WMUL / 100  … WMUL=1290 は円周27.9cm に対応
 #   cm    = deg * SMUL / 10000 … SMUL=775 は円周27.9cm に対応
@@ -1529,49 +1530,56 @@ def auto_sign_test():
     print("sign test: CMD_FLIP=%d SIGN_GYRO=%d" % (CMD_FLIP, SIGN_GYRO_CUR))
     # 3) ホイール円周キャリブレーション (その場旋回)
     # 1輪の移動弧 = (B/2)*θ = (φ/360)*C → C[cm] = B*θ[deg]*π/φ
-    # 値は C*100 で持つ: (B*10)*θ*31416/(1000*φ)
-    #    ジャイロ積分 θ (バイアス除去済み) とホイール回転角 φ から円周を実測する。
-    #    滑りで過小評価しがちなので、±20% 内のときだけ±15%にクランプして採用。
-    c100_sum = 0
-    c100_n = 0
-    for mdir in (1, -1):
-        aL0 = mL.angle()
-        aR0 = mR.angle()
-        wsum = 0
-        t0 = sw.time()
-        while sw.time() - t0 < CAL_MS:
-            mL.run(-TEST_SPEED * CMD_FLIP * mdir)
-            mR.run(TEST_SPEED * CMD_FLIP * mdir)
-            wsum += int(hub.imu.angular_velocity(Axis.Z) * 1000) - wz_bias
-            wait(2)
+    # 失敗しても起動を妨げないよう try/except で保護 (測れなければデフォルト継続)。
+    # 値は C*100 で持つ。オーバーフロー回避のため分割スケール (B10*θ*314)//(10*φ)
+    try:
+        c100_sum = 0
+        c100_n = 0
+        for mdir in (1, -1):
+            aL0 = mL.angle()
+            aR0 = mR.angle()
+            wsum = 0
+            t0 = sw.time()
+            while sw.time() - t0 < CAL_MS:
+                mL.run(-TEST_SPEED * CMD_FLIP * mdir)
+                mR.run(TEST_SPEED * CMD_FLIP * mdir)
+                wsum += int(hub.imu.angular_velocity(Axis.Z) * 1000) - wz_bias
+                wait(2)
+            mL.run(0)
+            mR.run(0)
+            th_deg = abs(wsum) // 1000
+            if th_deg > 720:
+                th_deg = 720        # 0.8秒で2回転以上は測定不良
+            phi = (abs(mL.angle() - aL0) + abs(mR.angle() - aR0)) // 2
+            if th_deg >= 15 and phi >= 40:
+                c100_sum += (int(TRACK_B_CM * 10) * th_deg * 314) // (10 * phi)
+                c100_n += 1
+        if c100_n > 0:
+            c_avg = c100_sum // c100_n
+            if 2200 <= c_avg <= 3350:      # 実測 22.0〜33.5cm のみ採用
+                f1000 = 2790000 // c_avg   # 27.9cm との比 ×1000
+                WMUL = 1290 * f1000 // 1000
+                SMUL = 775 * f1000 // 1000
+                if WMUL > 1500:
+                    WMUL = 1500
+                elif WMUL < 1100:
+                    WMUL = 1100
+                if SMUL > 900:
+                    SMUL = 900
+                elif SMUL < 660:
+                    SMUL = 660
+            else:
+                print("WARN: wheel cal out of range (C=%d.%dcm) - keeping 27.9cm"
+                      % (c_avg // 100, c_avg // 10 % 10))
+                return
+            print("wheel cal: C=%d.%dcm WMUL=%d SMUL=%d"
+                  % (c_avg // 100, c_avg // 10 % 10, WMUL, SMUL))
+        else:
+            print("WARN: wheel cal did not measure (gyro/angle too small)")
+    except Exception:
         mL.run(0)
         mR.run(0)
-        th_deg = abs(wsum) // 1000
-        phi = (abs(mL.angle() - aL0) + abs(mR.angle() - aR0)) // 2
-        if th_deg >= 15 and phi >= 40:
-            c100_sum += (int(TRACK_B_CM * 10) * th_deg * 31416) // (1000 * phi)
-            c100_n += 1
-    if c100_n > 0:
-        c_avg = c100_sum // c100_n
-        if 2200 <= c_avg <= 3350:      # 実測 22.0〜33.5cm のみ採用
-            f1000 = 2790000 // c_avg   # 27.9cm との比 ×1000
-            WMUL = 1290 * f1000 // 1000
-            SMUL = 775 * f1000 // 1000
-            if WMUL > 1500:
-                WMUL = 1500
-            elif WMUL < 1100:
-                WMUL = 1100
-            if SMUL > 900:
-                SMUL = 900
-            elif SMUL < 660:
-                SMUL = 660
-        else:
-            print("WARN: wheel cal out of range (C=%d.%dcm) - keeping 27.9cm"
-                  % (c_avg // 100, c_avg // 10 % 10))
-            return
-        print("wheel cal: C=%d.%dcm WMUL=%d SMUL=%d" % (c_avg // 100, c_avg // 10 % 10, WMUL, SMUL))
-    else:
-        print("WARN: wheel cal did not measure (gyro/angle too small)")
+        print("WARN: wheel cal failed - keeping default (27.9cm)")
 
 
 def wait_for_start():

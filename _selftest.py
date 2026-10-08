@@ -195,6 +195,8 @@ assert "def finalize_lap" in _src  # (finalize_lap は残す)
 # マーカーは両センサ同時暗で駆動
 assert "both_dark = (nL < 350) and (nR < 350)" in _src, "both_dark 判定が無い"
 assert "marker_tick(s_cm, both_dark)" in _src, "marker_tick 呼び出しが無い"
+# ラップタイムのエッジ補間: mark_f はティック内でエッジが起きた割合 → 残り側を引く
+assert "(100 - mark_f) * mark_dt // 100" in _src, "ラップタイム補間式が無い"
 # bytearray スライス代入の禁止 (Pybricks で TypeError)
 for _bad in ("[:] =", "[:]="):
     assert _bad not in _src, "bytearray スライス代入が残っている: %s" % _bad
@@ -311,5 +313,15 @@ assert vmax_from_stn(100, 200, 70) == 38     # 急曲線 → v_kin=38
 assert vmax_from_stn(300, 200, 70) == 38     # 更に急でも κ1000クランプ
 assert vmax_from_stn(0, 200, 70) == 70       # 直線 → 上限
 print("PASS vmax_from_stn (curvature-based speed limit)")
+
+# ---- テストZ: ラップタイムのエッジ補間 (run_laps と同一式) ----
+def lap_time(elapsed_ms, mark_f, mark_dt):
+    return elapsed_ms - (100 - mark_f) * mark_dt // 100
+
+
+assert lap_time(10000, 0, 10) == 9990     # エッジ=前ティック直後 → ほぼ1ティック分を引く
+assert lap_time(10000, 100, 10) == 10000  # エッジ=現在ティック → 補正なし
+assert lap_time(10000, 50, 10) == 9995    # 中間
+print("PASS lap-time edge interpolation (f=0/50/100)")
 
 print("ALL TESTS PASSED")

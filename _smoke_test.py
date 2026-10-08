@@ -292,7 +292,7 @@ def sim_laps(n_laps):
                 M.lap_done = True
 
         sim_loop(lambda: not M.lap_done, 200000, on_tick)
-        t_lap = M.sw.time() - M.lap_start_t - M.mark_f * M.mark_dt // 100
+        t_lap = M.sw.time() - M.lap_start_t - (100 - M.mark_f) * M.mark_dt // 100
         M.finalize_lap(t_lap)
         times.append(t_lap)
     return times
@@ -314,7 +314,7 @@ def sim_marker_miss():
             M.lap_done = True
 
     sim_loop(lambda: not M.lap_done, 300000, on_tick)
-    t_lap = M.sw.time() - M.lap_start_t - M.mark_f * M.mark_dt // 100
+    t_lap = M.sw.time() - M.lap_start_t - (100 - M.mark_f) * M.mark_dt // 100
     M.finalize_lap(t_lap)   # invalid lap → 早期 return
     assert M.lap_valid is False
     print("marker miss handled ok")

@@ -594,7 +594,10 @@ def tick(dt_ms, t_ms):
 
 def hk(t_ms):
     global last_batt, comp, vbat, last_disp, last_rate, rate_hz, tick_cnt
-    global dump_enable, dump_idx, dump_end, prev_left, prev_right
+    global dump_enable, dump_idx, dump_end, prev_left, prev_right, last_hk
+
+    # 呼び出し側の10msスロットルを実効化 (hk自体が最終実行時刻を保持する)
+    last_hk = t_ms
 
     if t_ms - last_batt >= 100:
         last_batt = t_ms
@@ -743,9 +746,6 @@ def finalize_lap(t_lap):
     # 追従が安定したラップのみ FF適用を許可 (ゴミ学習による暴れを防ぐ)
     ff_armed = ff_armed or (rms_e <= ILC_TRACK_OK)
 
-    # ---- 学習FF更新 (ILC: ff += e_avg * alpha / (10 * v_bin), v=100基準) ----
-    # 1周目の追従誤差から曲線の必要なステアリングを学習し、2周目以降に事前適用する。
-    ilc_rms = 0
     nb = track_len // BIN_CM + 2
     if nb > N_BINS:
         nb = N_BINS
@@ -788,7 +788,6 @@ def finalize_lap(t_lap):
 
     # ---- 学習FF更新 (ILC: ff += e_avg * alpha / (10 * v_bin), v=100基準) ----
     # 1周目の追従誤差から曲線の必要なステアリングを学習し、2周目以降に事前適用する。
-    ilc_rms = 0
     for i in range(nb):
         c = err_cnt[i]
         if c >= ILC_MIN_CNT:
@@ -803,11 +802,9 @@ def finalize_lap(t_lap):
             elif f < -FF_MAX:
                 f = -FF_MAX
             i16set(ff, i, f)
-            ilc_rms += f * f
             err_cnt[i] = 0
             i16set(err_sum, i, 0)
             i16set(vsum_bin, i, 0)
-    ilc_rms = isqrt(ilc_rms // max(N_BINS, 1))
 
     new_best_flag = False
     if best_time == 0 or t_lap < best_time:
@@ -933,7 +930,9 @@ def run_laps():
         # ラップ終了処理(finalize)中にモーターが無制御のまま走り去らないよう停止
         mL.run(0)
         mR.run(0)
-        t_lap = sw.time() - lap_start_t - mark_f * mark_dt // 100
+        # mark_f は検出ティック内でエッジが起きた割合 x100 (0=直前側, 100=現在側)。
+        # 通過時刻 = t_now - dt*(100-f)/100 なので残り側を引く。
+        t_lap = sw.time() - lap_start_t - (100 - mark_f) * mark_dt // 100
         finalize_lap(t_lap)
         wait(100)   # finalize対象の残留入力を吸収してから次ラップ開始
 
